@@ -49,8 +49,12 @@ typedef struct {
     const char* httpVersion;
 
     // Headers
-    const char* rawHeaders;
-    int rawHeadersLength;
+    const char** rawHeaders;
+    void* rawHeadersBase;
+    unsigned long rawHeadersLength;
+    unsigned long rawHeadersCount;
+    unsigned long rawHeadersCountRead;
+    unsigned long rawHeadersBytesRead;
     const HttpServerRequestStateHeaders* headers;
 
     // Body
@@ -75,3 +79,5 @@ void destroy_http_server_request(HttpServerRequest** request);
 void http_server_accept_line(const char* data, unsigned long length, char** current, HttpServerRequest* request);
 
 void janitor_http_server_request(HttpServerRequest* request);
+
+void parse_http_header(const char* header, char* name, int name_buffer_size, char* value, int value_buffer_size);

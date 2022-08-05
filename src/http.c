@@ -62,32 +62,34 @@ void destroy_http_server_request(HttpServerRequest** request) {
     *request = NULL;
 }
 
-/**
- * Seek a string buffer until the next CRLF is reached.
- * The pointer after that CRLF is returned.
- *
- * @param buffer_ptr The pointer into the buffer to start reading.
- * @return The pointer after the next CRLF.
- */
-const char* seek_until_crlf(const char* buffer_ptr) {
-    // Keep seeking until \r is found, followed by \n.
-    while (*(++buffer_ptr) != '\r' && *(++buffer_ptr) != '\n');
-    // Then, return the seeked buffer pointer, having seeked to after the \r\n.
-    return buffer_ptr;
+static inline const char* seek_until_crlf(const char* buffer_ptr) {
+    return strstr(buffer_ptr, "\r\n");
 }
 
-const char* seek_after_crlf(const char* buffer_ptr) {
+static inline const char* seek_after_crlf(const char* buffer_ptr) {
     return seek_until_crlf(buffer_ptr) + 2;
 }
 
-const char* seek_until_space(const char* buffer_ptr) {
-    // Keep seeking until space is found.
-    while (*(++buffer_ptr) != ' ');
-    return buffer_ptr;
+static inline const char* seek_until_space(const char* buffer_ptr) {
+    return strchr(buffer_ptr, ' ');
 }
 
-const char* seek_after_space(const char* buffer_ptr) {
+static inline const char* seek_after_space(const char* buffer_ptr) {
     return seek_until_space(buffer_ptr) + 1;
+}
+
+void parse_http_header(const char* header, char* name, int name_buffer_size, char* value, int value_buffer_size) {
+    bzero(name, name_buffer_size);
+    bzero(value, value_buffer_size);
+
+    unsigned long total_length = strlen(header);
+    char* split = strchr(header, ':');
+
+    unsigned long key_length = split - header;
+    unsigned long value_length = total_length - ((uintptr_t) split + 1);
+
+    strncpy(name, header, key_length > (name_buffer_size - 1) ? (name_buffer_size - 1) : key_length);
+    strncpy(value, split + 1, value_length > (value_buffer_size - 1) ? (value_buffer_size - 1) : value_length);
 }
 
 void janitor_http_server_request(HttpServerRequest* request) {
@@ -95,13 +97,16 @@ void janitor_http_server_request(HttpServerRequest* request) {
         free((void*) request->path);
         free((void*) request->httpVersion);
     }
+    if (request->readState > READ_HEADERS) {
+        free((void*) request->rawHeaders);
+    }
 }
 
 #define END_WITH_STATUS(request, status) (request)->readState = READ_DONE; \
     (request)->readStatus = (status);                                      \
     return
 
-#define CHECK_ADDR_OFFSET(current, offset, limit, cleanup) if ((uintptr_t) *(current) + (offset) >= (limit)) { END_WITH_STATUS(request, MALFORMED_REQUEST); cleanup }
+#define CHECK_ADDR_OFFSET(current, offset, limit, cleanup) if ((uintptr_t) *(current) + (offset) >= (limit)) { cleanup; END_WITH_STATUS(request, MALFORMED_REQUEST); }
 #define CHECK_ADDR(current, limit, cleanup) CHECK_ADDR_OFFSET(current, 0, limit, cleanup)
 
 void http_server_accept_line(const char* data, unsigned long length, char** current, HttpServerRequest* request) {
@@ -142,28 +147,79 @@ void http_server_accept_line(const char* data, unsigned long length, char** curr
             *current = *current + path_len + 1;
 
             // Request HTTP version
-            uintptr_t ver_len = (uintptr_t) seek_until_space(*current) - (uintptr_t) *current;
-            CHECK_ADDR_OFFSET(current, path_len + 1, ptr_limit, {
+            uintptr_t ver_len = (uintptr_t) seek_until_crlf(*current) - (uintptr_t) *current;
+            CHECK_ADDR_OFFSET(current, ver_len + 2, ptr_limit, {
                 free(path);
             })
-            const char* ver = malloc(ver_len + 1);
+            char* ver = malloc(ver_len + 1);
+            strncpy(ver, *current, ver_len);
             ((char*) ver)[ver_len] = '\0';
             request->httpVersion = ver;
 
             // Seek to headers
-            *current = (char*) seek_after_crlf(*current);
+            *current += ver_len + 2;
             request->readState = READ_HEADERS;
+
+            break;
         }
 
         case READ_HEADERS: {
-            // Determine the number of headers that need to be saved.
-            // Also determine the end of the headers.
-            // TODO
+            if (request->rawHeaders == NULL) {
+                // Determine the number of headers that need to be saved.
+                // Also determine the end of the headers.
 
-            // Save the headers line by line.
-            // TODO
+                // Headers ends with double CRLF, so keep seeking until two consecutive
+                // CRLFs are encountered.
+                unsigned long headerCount = 0;
+                unsigned long rawHeaderBytes = 0;
+                const char* header_seek = *current;
+                const char* header_seek_cache;
 
-            request->readState = READ_BODY;
+                do {
+                    header_seek_cache = header_seek;
+                    header_seek = seek_until_crlf(header_seek);
+
+                    // Add difference for header seek (length of header).
+                    rawHeaderBytes += (header_seek - header_seek_cache);
+                    // Add one for null terminator byte.
+                    rawHeaderBytes += 1;
+
+                    header_seek += 2;
+                    headerCount++;
+                }
+                    // Seek until the next CRLF is immediately after the current one.
+                while (seek_until_crlf(header_seek) != header_seek);
+
+                request->rawHeadersBytesRead = 0;
+                request->rawHeadersCountRead = 0;
+                request->rawHeadersCount = headerCount;
+                request->rawHeadersLength = rawHeaderBytes;
+                request->rawHeadersBase = malloc(rawHeaderBytes);
+                request->rawHeaders = calloc(headerCount, sizeof(const char*));
+            }
+
+            // Read and save the current header.
+            if (request->rawHeadersBytesRead < request->rawHeadersLength) {
+                // Determine the length in bytes of the current header.
+                char* currentHeader = (char*) seek_until_crlf(*current);
+                uintptr_t header_length = currentHeader - *current;
+
+                // Copy the current header into the buffer reserved for all the request headers.
+                strncpy(request->rawHeadersBase + request->rawHeadersBytesRead, *current, header_length);
+                // Mark the base address of the header string in rawHeaders.
+                request->rawHeaders[request->rawHeadersCountRead] = request->rawHeadersBase + request->rawHeadersBytesRead;
+
+                // Update the metrics on the number of headers read.
+                request->rawHeadersBytesRead += header_length + 1;
+                request->rawHeadersCountRead++;
+
+                // Seek past the current header (and its CRLF).
+                *current = currentHeader + 2;
+            }
+            // If we've read all the headers, continue to the READ_BODY state.
+            else request->readState = READ_BODY;
+
+            break;
         }
 
         case READ_BODY: {
@@ -171,6 +227,8 @@ void http_server_accept_line(const char* data, unsigned long length, char** curr
             request->bodyLength = 0;
 
             request->readState = READ_DONE;
+
+            break;
         }
 
         case READ_DONE: { return; }

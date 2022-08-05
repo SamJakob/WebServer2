@@ -30,7 +30,7 @@ bool start_tcp_server(TcpServer* server) {
     server->socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server->socket == -1) return false;
 
-#if HTTP_APP_DEBUG
+#if ALLOW_PORT_REUSE
     // If we're in debug mode, allow TCP port reuse.
     int soReusePort = 1;
     setsockopt(server->socket, SOL_SOCKET, SO_REUSEPORT, &soReusePort, sizeof(soReusePort));
